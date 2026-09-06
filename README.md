@@ -269,6 +269,35 @@ systemctl is-enabled sleep.target suspend.target hibernate.target hybrid-sleep.t
 
 All four should say `masked`.
 
+### Stop GNOME blanking the screen (drops remote sessions)
+
+`harden` runs as root, and GNOME's screen blanking is a **per-user** setting it
+cannot reach. It defaults to 5 minutes, and on X11 that regularly takes an
+AnyDesk session with it — which looks exactly like a network drop.
+
+```bash
+gsettings get org.gnome.desktop.session idle-delay
+```
+
+`uint32 300` is 5 minutes. Run these as your normal user, in a terminal on the
+machine's own desktop (not over SSH — gsettings needs the session bus):
+
+```bash
+gsettings set org.gnome.desktop.session idle-delay 0
+```
+
+```bash
+gsettings set org.gnome.desktop.screensaver idle-activation-enabled false
+```
+
+```bash
+gsettings set org.gnome.desktop.screensaver lock-enabled false
+```
+
+```bash
+gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'nothing'
+```
+
 ---
 
 ## AnyDesk: `display_server_not_supported`

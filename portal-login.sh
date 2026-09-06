@@ -34,7 +34,7 @@
 #
 set -uo pipefail
 
-VERSION=2.1.2
+VERSION=2.1.3
 APP=portal-login
 SELF=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
 
@@ -1374,6 +1374,26 @@ NMPS_EOF
         && echo "  ok  autoconnect (infinite retries) on '$cn'"
     done
   fi
+
+  # GNOME's screen blanking is a per-user gsettings value, so a root-level
+  # harden cannot reach it. It defaults to 5 minutes and regularly takes a
+  # remote-desktop session down with it, which looks exactly like a network drop.
+  cat <<'GS'
+
+  ONE MORE THING, and root cannot do it for you:
+
+  GNOME blanks the screen after 5 minutes by default, which can drop an AnyDesk
+  or VNC session. logind's IdleAction (set above) does NOT cover this. Run these
+  as your normal desktop user, in a terminal ON the machine's own desktop:
+
+    gsettings set org.gnome.desktop.session idle-delay 0
+    gsettings set org.gnome.desktop.screensaver idle-activation-enabled false
+    gsettings set org.gnome.desktop.screensaver lock-enabled false
+    gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'nothing'
+
+  Check the current value with:
+    gsettings get org.gnome.desktop.session idle-delay      # uint32 300 = 5 min
+GS
 
   cat <<'UNDO'
 
