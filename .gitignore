@@ -1,0 +1,26 @@
+# diagnostic output - contains your network layout, and is yours not the repo's
+portal-check-report.txt
+*-report.txt
+
+# anything holding real credentials must never be committed
+portal-login.conf
+*.local.conf
+secrets*
+password
+credentials
+
+# runtime artefacts
+last-page.html
+last-result.html
+state
+cookies.txt
+*.log
+
+# python
+__pycache__/
+*.py[cod]
+
+# editors / os
+*.swp
+*~
+.DS_Store

@@ -1,0 +1,13 @@
+[Unit]
+Description=Check the captive portal login every 10 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=10min
+AccuracySec=15s
+RandomizedDelaySec=20s
+Persistent=true
+Unit=portal-autologin.service
+
+[Install]
+WantedBy=timers.target

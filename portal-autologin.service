@@ -1,0 +1,10 @@
+[Unit]
+Description=Captive portal auto-login (check and re-login if the session expired)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/share/portal-autologin/venv/bin/python %h/.local/share/portal-autologin/portal-autologin.py --once
+TimeoutStartSec=240
+Nice=10
