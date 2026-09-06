@@ -59,20 +59,33 @@ to do ("refrain from closing this dialog box").
 
 ---
 
-## Step 0 — copy the two files to the GPU box
+## Step 0 — get the files onto the GPU box
 
-From your laptop, while you can still reach the box:
+**Easiest — clone it on the box** (do this while it still has internet):
+
+```bash
+git clone https://github.com/Masudali23/portal-autologin.git && cd portal-autologin
+```
+
+```bash
+chmod +x portal-login.sh portal-check.sh
+```
+
+**No git, or no internet on the box right now?** Copy the two files from your
+laptop over SSH:
 
 ```bash
 scp portal-login.sh portal-check.sh youruser@gpu-box:~/
 ```
 
-If you don't have SSH set up, use the AnyDesk file transfer, or a USB stick.
-Then on the box:
+or download them directly on the box:
 
 ```bash
-chmod +x ~/portal-login.sh ~/portal-check.sh
+curl -fsSLO https://raw.githubusercontent.com/Masudali23/portal-autologin/main/portal-login.sh -O https://raw.githubusercontent.com/Masudali23/portal-autologin/main/portal-check.sh && chmod +x portal-login.sh portal-check.sh
 ```
+
+Failing all of that, AnyDesk's file transfer or a USB stick works fine — it is
+two text files.
 
 ---
 
