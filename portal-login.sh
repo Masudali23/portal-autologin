@@ -34,7 +34,7 @@
 #
 set -uo pipefail
 
-VERSION=2.1.3
+VERSION=2.2.0
 APP=portal-login
 SELF=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
 
@@ -615,6 +615,7 @@ verify_online() {
 }
 
 _login_attempt() {
+  local forced=${1:-no}
   [ -n "$PORTAL_USERNAME" ] || { err "PORTAL_USERNAME is not set (edit $CONF_FILE)"; return 4; }
   [ -n "$PORTAL_PASSWORD" ] || { err "PORTAL_PASSWORD is not set (edit $CONF_FILE)"; return 4; }
 
@@ -631,6 +632,23 @@ _login_attempt() {
   #
   # The logout matters because IIT BHU caps an account at 4 concurrent systems
   # and clearing an over-limit needs an in-person CCIS visit.
+  # GUARD: never log out on a hunch.
+  #
+  # classify() can return NEED_LOGIN from a transient probe failure - congestion,
+  # a blocked probe host, one dropped packet. Before this guard existed, that
+  # produced a /logout? on a perfectly healthy link, which tears down the
+  # gateway's session and kills every established connection through it,
+  # including any live SSH or remote-desktop session. A self-inflicted outage,
+  # once every timer tick.
+  #
+  # So: re-check connectivity immediately before releasing anything, and if we
+  # are actually fine, do nothing at all. A forced `login` skips the guard,
+  # because there the user has explicitly asked for a fresh session.
+  if [ "$forced" != "force" ] && probe_internet; then
+    info "connectivity is fine on re-check - not logging out, nothing to do"
+    return 0
+  fi
+
   if [ "$(lc "$LOGOUT_BEFORE_LOGIN")" = "yes" ]; then
     local origin lo_magic=""
     origin=$(portal_origin "$page_url")
@@ -818,12 +836,12 @@ _login_attempt() {
 
 # One retry with a freshly minted token, then give up with a real diagnosis.
 do_login() {
-  local rc
-  _login_attempt; rc=$?
+  local forced=${1:-no} rc
+  _login_attempt "$forced"; rc=$?
   if [ "$rc" -eq 6 ]; then
     warn "retrying once with a freshly minted token"
     sleep 2
-    _login_attempt; rc=$?
+    _login_attempt "$forced"; rc=$?
   fi
   if [ "$rc" -eq 6 ]; then
     err "the portal keeps returning its login page. In order of likelihood:"
@@ -928,7 +946,7 @@ run_once() {
     return 3
   fi
 
-  do_login; rc=$?
+  do_login "$force"; rc=$?
   case $rc in
     0)
       FAILS=0; NEXT_ATTEMPT=0; LAST_OK=$(date +%s); LAST_STATE=ONLINE; OFFLINE_SINCE=0
