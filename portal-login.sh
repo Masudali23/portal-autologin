@@ -34,7 +34,7 @@
 #
 set -uo pipefail
 
-VERSION=2.1.0
+VERSION=2.1.1
 APP=portal-login
 SELF=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
 
@@ -1362,8 +1362,17 @@ NMPS_EOF
 
   cat <<'UNDO'
 
-  Reload with:  sudo systemctl restart systemd-logind NetworkManager
-  (that briefly drops the network - do it while you are physically present)
+  APPLYING THESE:
+
+    wifi powersave:  sudo systemctl reload NetworkManager
+                     (reload re-reads the config WITHOUT dropping connections)
+
+    logind settings: they take effect at the next reboot. Nothing to run.
+
+  *** DO NOT run `systemctl restart systemd-logind` ***
+  Restarting logind tears down the running desktop session: the screen goes
+  black and the machine looks hung. There is no need for it - a reboot at any
+  convenient time picks the settings up.
 
   To undo:
     sudo systemctl unmask sleep.target suspend.target hibernate.target hybrid-sleep.target

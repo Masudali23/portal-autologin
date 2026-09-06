@@ -292,11 +292,19 @@ auto-reconnect with infinite retries. It prints exact undo instructions at the e
 Wifi power-saving in particular is a very common cause of "it was fine and then it
 just dropped at 2am" — the card sleeps and never cleanly wakes.
 
-Apply it (this briefly drops the network, so do it while you're present):
+Applying it:
 
 ```bash
-sudo systemctl restart systemd-logind NetworkManager
+sudo systemctl reload NetworkManager
 ```
+
+`reload` re-reads the config without dropping any connection. The logind
+settings need no command at all — they take effect at the next reboot.
+
+> **Never run `systemctl restart systemd-logind` on a machine with a desktop
+> session.** It tears the session down: the screen goes black and the box looks
+> hung. There is nothing to gain from it — a reboot whenever convenient picks
+> the settings up. (Earlier versions of this README wrongly suggested it.)
 
 ### The 802.1X trap — check this even if you do nothing else
 
