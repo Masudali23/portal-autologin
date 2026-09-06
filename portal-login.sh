@@ -32,7 +32,7 @@
 #
 set -uo pipefail
 
-VERSION=2.0.0
+VERSION=2.0.1
 APP=portal-login
 SELF=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
 
@@ -146,7 +146,10 @@ cleanup() {
 # flock is the right tool; mkdir is the fallback because it is atomic everywhere.
 acquire_lock() {
   if have flock; then
-    exec 9>"$LOCK_FILE" 2>/dev/null || return 0
+    # NOTE: `exec 9>f 2>/dev/null` would ALSO redirect stderr permanently and
+    # silence every subsequent log line. Keep the stderr redirect inside the
+    # group; the fd 9 assignment still persists because {} is not a subshell.
+    { exec 9>"$LOCK_FILE"; } 2>/dev/null || return 0
     flock -n 9 2>/dev/null || return 1
     return 0
   fi
@@ -609,12 +612,31 @@ verify_online() {
   done
 }
 
-do_login() {
+_login_attempt() {
   [ -n "$PORTAL_USERNAME" ] || { err "PORTAL_USERNAME is not set (edit $CONF_FILE)"; return 4; }
   [ -n "$PORTAL_PASSWORD" ] || { err "PORTAL_PASSWORD is not set (edit $CONF_FILE)"; return 4; }
 
   local page_url res code eff
   page_url=$(discover_login_url)
+
+  # Release the session slot we already hold, BEFORE minting a token.
+  #
+  # Order is load-bearing. `magic` belongs to the specific intercepted
+  # connection that produced it, and a logout invalidates it - so logging out
+  # after scraping the token means POSTing a dead token, which a FortiGate
+  # answers by silently serving the login page again. Log out first, then take
+  # a fresh intercept.
+  #
+  # The logout matters because IIT BHU caps an account at 4 concurrent systems
+  # and clearing an over-limit needs an in-person CCIS visit.
+  if [ "$(lc "$LOGOUT_BEFORE_LOGIN")" = "yes" ]; then
+    local origin; origin=$(portal_origin "$page_url")
+    info "releasing any existing session: $origin/logout?"
+    http_get "$origin/logout?" "$TMP/logout.html" >/dev/null 2>&1 || true
+    sleep 1
+    page_url=$(discover_login_url)      # fresh intercept => fresh magic
+  fi
+
   info "fetching login page: $page_url"
 
   res=$(http_get "$page_url" "$TMP/page.html" --follow) || {
@@ -671,19 +693,6 @@ do_login() {
   info "form fields: username=${user_field:-<none>} password=$pass_field"
 
   # --- build the POST ----------------------------------------------------
-  # Free the session slot we already hold before taking another one.
-  #
-  # IIT BHU caps an account at 4 concurrent systems, and going over it puts the
-  # account in a "Concurrent Over-limit" state that can ONLY be cleared by
-  # visiting CCIS in person with an ID card. A login loop that keeps minting
-  # fresh sessions without releasing the old ones can walk you into that state
-  # overnight, so releasing first is not optional here.
-  if [ "$(lc "$LOGOUT_BEFORE_LOGIN")" = "yes" ]; then
-    local origin; origin=$(portal_origin "$eff")
-    debug "releasing any existing session: $origin/logout?"
-    http_get "$origin/logout?" "$TMP/logout.html" >/dev/null 2>&1 || true
-  fi
-
   local action method target
   action=$(form_attr "$TMP/form.html" action | html_unescape)
   method=$(form_attr "$TMP/form.html" method)
@@ -777,9 +786,37 @@ do_login() {
     return 0
   fi
 
+  # The signature FortiGate failure: HTTP 200 and the login form all over
+  # again, with no error text anywhere. Almost always a stale/rejected token.
+  if grep -qiE 'type=["'"'"']?password|name=["'"'"']?magic' "$TMP/result.html" 2>/dev/null; then
+    warn "the portal answered with its login page again rather than authenticating"
+    cp "$TMP/result.html" "$STATE_DIR/last-result.html" 2>/dev/null || true
+    return 6
+  fi
+
   err "login was submitted but connectivity did not come back"
   cp "$TMP/result.html" "$STATE_DIR/last-result.html" 2>/dev/null || true
   return 1
+}
+
+# One retry with a freshly minted token, then give up with a real diagnosis.
+do_login() {
+  local rc
+  _login_attempt; rc=$?
+  if [ "$rc" -eq 6 ]; then
+    warn "retrying once with a freshly minted token"
+    sleep 2
+    _login_attempt; rc=$?
+  fi
+  if [ "$rc" -eq 6 ]; then
+    err "the portal keeps returning its login page. In order of likelihood:"
+    err "  1. wrong username or password  -> check $CONF_FILE"
+    err "  2. the account is at its 4-system concurrent limit"
+    err "  3. the form wants a field we are not sending -> run '$APP inspect'"
+    err "  the portal's own reply is saved at $STATE_DIR/last-result.html"
+    rc=1
+  fi
+  return $rc
 }
 
 # --------------------------------------------------------------------------

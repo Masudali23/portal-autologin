@@ -294,6 +294,24 @@ With Steps 2–5 done, the box stays online and awake, so AnyDesk has a working
 network to reconnect over — which is the thing that was actually failing. That
 may be all you need.
 
+**But first, confirm you actually have a way in.** `portal-check.sh` section 8
+tells you. If it reports no AnyDesk process, nothing listening on `:22`, and
+Tailscale SSH not enabled, then keeping the box online does not help — there is
+nothing to connect *to*. Enable one of them while you are physically at the
+machine:
+
+```bash
+sudo tailscale up --ssh --hostname gpu-box
+```
+
+or install a normal SSH server:
+
+```bash
+sudo apt install -y openssh-server && sudo systemctl enable --now ssh
+```
+
+Verify from your laptop before you walk away.
+
 If you want something sturdier, know this first:
 
 > CCIS states there is **no institute VPN facility**, and CAIT clause 10
@@ -415,6 +433,20 @@ Leave it on `auto`.
 ---
 
 ## Troubleshooting
+
+**`portal-login login` prints nothing at all** — fixed in v2.0.1. A lock bug
+(`exec 9>file 2>/dev/null`, which redirects stderr *permanently* rather than just
+for that command) silenced every log line whenever `flock` was present. `inspect`
+and `status` still printed because they run before the lock is taken. If you see
+this, `git pull` and reinstall.
+
+**The gateway is different on wifi than on LAN** — that is normal here. IIT BHU
+runs a FortiGate per zone: you may hit `192.168.252.1` on wifi and
+`192.168.249.1` on the departmental LAN. `PORTAL_URL` in the config is only a
+last-resort fallback; what actually matters is that the tool reads the gateway
+out of the interception at runtime, so it follows you between wifi and LAN with
+no config change. `sudo portal-login inspect` prints the one it found under
+"discovered URL".
 
 **"could not find a password field"** — run `sudo portal-login inspect` and set
 `USER_FIELD` / `PASS_FIELD` explicitly in the config. The raw page is saved to

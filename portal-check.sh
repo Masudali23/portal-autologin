@@ -211,8 +211,23 @@ if have systemctl; then
     [ -n "$st" ] && [ "$st" != "inactive" ] && kv "service $u" "$st"
   done
 fi
-kv "sshd listening" "$( (ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null) | grep -c ':22 ' )"
-kv "anydesk running" "$(pgrep -c anydesk 2>/dev/null || echo 0)"
+_n=$( (ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null) | grep -c ':22 ' ); kv "sshd listening on :22" "${_n:-0}"
+_n=$(pgrep -c anydesk 2>/dev/null | head -1);                                kv "anydesk processes"    "${_n:-0}"
+if have tailscale; then
+  _st=$(tailscale status 2>&1 | head -1)
+  kv "tailscale status"  "${_st:-<unknown>}"
+  kv "tailscale IPv4"    "$(tailscale ip -4 2>/dev/null | head -1 || echo '<none>')"
+  _ssh=$(tailscale status --json 2>/dev/null | tr -d ' ' | grep -c '"RunningSSHServer":true')
+  kv "tailscale SSH server" "$([ "${_ssh:-0}" -gt 0 ] && echo 'enabled' || echo 'NOT enabled')"
+fi
+if [ "${_n:-0}" -eq 0 ]; then
+  _sshd=$( (ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null) | grep -c ':22 ' )
+  if [ "${_sshd:-0}" -eq 0 ]; then
+    note "No AnyDesk, and nothing listening on :22. Your only way in is Tailscale."
+    note "Confirm it works BEFORE you rely on it:  sudo tailscale up --ssh"
+    note "then from your laptop:  ssh $(id -un)@$(uname -n)"
+  fi
+fi
 
 # ==========================================================================
 sec "9. PORTAL-LOGIN INSTALL STATE"
@@ -230,8 +245,8 @@ if [ -f /etc/portal-login/portal-login.conf ]; then
   fi
 fi
 if have systemctl; then
-  kv "timer enabled" "$(systemctl is-enabled portal-login.timer 2>/dev/null || echo 'not installed')"
-  kv "timer active"  "$(systemctl is-active  portal-login.timer 2>/dev/null || echo 'not installed')"
+  _v=$(systemctl is-enabled portal-login.timer 2>/dev/null | head -1); kv "timer enabled" "${_v:-not installed}"
+  _v=$(systemctl is-active  portal-login.timer 2>/dev/null | head -1); kv "timer active"  "${_v:-not installed}"
   say ""
   systemctl list-timers portal-login.timer --no-pager 2>/dev/null | head -4 | sed 's/^/    /' | tee -a "$OUT"
   say ""
