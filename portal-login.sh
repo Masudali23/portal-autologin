@@ -34,7 +34,7 @@
 #
 set -uo pipefail
 
-VERSION=2.1.1
+VERSION=2.1.2
 APP=portal-login
 SELF=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
 
@@ -632,9 +632,24 @@ _login_attempt() {
   # The logout matters because IIT BHU caps an account at 4 concurrent systems
   # and clearing an over-limit needs an in-person CCIS visit.
   if [ "$(lc "$LOGOUT_BEFORE_LOGIN")" = "yes" ]; then
-    local origin; origin=$(portal_origin "$page_url")
-    info "releasing any existing session: $origin/logout?"
-    http_get "$origin/logout?" "$TMP/logout.html" >/dev/null 2>&1 || true
+    local origin lo_magic=""
+    origin=$(portal_origin "$page_url")
+    # A FortiGate logout is scoped to a session, so a bare /logout? is often a
+    # no-op. The token of the session we currently hold is the query string of
+    # the keepalive URL saved at our last successful login - use it when we have
+    # it, and fall back to the bare form when we do not.
+    load_state
+    case "$KEEPALIVE_SAVED" in
+      *\?*) lo_magic=${KEEPALIVE_SAVED##*\?} ;;
+    esac
+    if [ -n "$lo_magic" ]; then
+      info "releasing the session we hold: $origin/logout?<token>"
+      http_get "$origin/logout?$lo_magic" "$TMP/logout.html" >/dev/null 2>&1 || true
+    else
+      info "releasing any existing session: $origin/logout?"
+      http_get "$origin/logout?" "$TMP/logout.html" >/dev/null 2>&1 || true
+    fi
+    KEEPALIVE_SAVED=""; save_state
     sleep 1
     page_url=$(discover_login_url)      # fresh intercept => fresh magic
   fi
