@@ -22,6 +22,8 @@
 #   daemon     loop forever (alternative to the systemd timer)
 #   inspect    dump the portal login form so you can pin field names
 #   install    install binary + config + systemd timer + NetworkManager hook
+#                --daemon  install an always-running service instead of the timer
+#                --timer   (default) run a check every 5 minutes
 #   uninstall  remove all of the above (keeps your config and logs)
 #   harden     opt-in system tweaks: no suspend, no wifi powersave, autoreconnect
 #   status     show timer/service state and the last log lines
@@ -32,7 +34,7 @@
 #
 set -uo pipefail
 
-VERSION=2.0.1
+VERSION=2.1.0
 APP=portal-login
 SELF=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
 
@@ -946,15 +948,40 @@ run_once() {
   esac
 }
 
+# Tell systemd we are still alive. If the loop ever wedges (a curl that hangs
+# past its own --max-time, a stuck DNS resolver), systemd kills and restarts us
+# rather than leaving a process that exists but does nothing - which is the
+# failure mode a plain "Restart=always" cannot catch.
+wd_ping() {
+  [ -n "${WATCHDOG_USEC:-}" ] || return 0
+  have systemd-notify && systemd-notify WATCHDOG=1 2>/dev/null
+  return 0
+}
+
+# Sleep in short chunks, pinging the watchdog as we go, so WatchdogSec can stay
+# tight no matter how long CHECK_INTERVAL is.
+wd_sleep() {
+  local left=$1 chunk
+  while [ "$left" -gt 0 ]; do
+    chunk=$(( left > 20 ? 20 : left ))
+    sleep "$chunk"
+    left=$(( left - chunk ))
+    wd_ping
+  done
+}
+
 run_daemon() {
   info "daemon mode: checking every ${CHECK_INTERVAL}s (+/-${JITTER}s)"
+  [ -n "${WATCHDOG_USEC:-}" ] && info "systemd watchdog active (${WATCHDOG_USEC}us)"
+  trap 'info "stopping on signal"; exit 0' INT TERM
   local nap
   while :; do
     run_once || true
+    wd_ping
     nap=$(( CHECK_INTERVAL - JITTER + (RANDOM % (2 * JITTER + 1)) ))
     [ "$nap" -lt 30 ] && nap=30
     debug "sleeping ${nap}s"
-    sleep "$nap"
+    wd_sleep "$nap"
   done
 }
 
@@ -996,6 +1023,7 @@ do_inspect() {
 # --------------------------------------------------------------------------
 # install / uninstall / harden / status
 # --------------------------------------------------------------------------
+INSTALL_MODE=timer        # timer | daemon  (see: install --daemon)
 BIN_PATH=/usr/local/sbin/$APP
 UNIT_DIR=/etc/systemd/system
 DISPATCH=/etc/NetworkManager/dispatcher.d/90-$APP
@@ -1085,6 +1113,42 @@ CONF_EOF
   chmod 600 "$1"
 }
 
+write_daemon_unit() {
+  cat > "$UNIT_DIR/$APP.service" <<DSVC_EOF
+[Unit]
+Description=Captive portal auto-login (always-on daemon)
+After=network-online.target
+Wants=network-online.target
+# Never stop trying. Without this, systemd gives up after 5 restarts in 10s and
+# the box stays offline until a human intervenes - the exact opposite of the point.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=$BIN_PATH daemon
+Restart=always
+RestartSec=30
+# The daemon reports liveness from a helper process, so notifications from any
+# pid in the cgroup must be accepted.
+NotifyAccess=all
+WatchdogSec=300
+Nice=10
+StateDirectory=$APP
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
+DSVC_EOF
+}
+
 do_install() {
   need_root install
   have curl || die "curl is required: sudo apt install -y curl  (or dnf/pacman)"
@@ -1104,6 +1168,17 @@ do_install() {
   install -d -m 0700 "$STATE_DIR"
 
   if have systemctl && [ -d /run/systemd/system ]; then
+   if [ "$INSTALL_MODE" = daemon ]; then
+    # switching modes: make sure the timer is not also running
+    systemctl disable --now "$APP.timer" >/dev/null 2>&1 || true
+    rm -f "$UNIT_DIR/$APP.timer"
+    write_daemon_unit
+    systemctl daemon-reload
+    systemctl enable --now "$APP.service" >/dev/null
+    echo "  ok  always-on daemon enabled (checks every ${CHECK_INTERVAL}s, restarts itself, starts at boot)"
+   else
+    # switching modes: make sure a daemon is not also running
+    systemctl disable --now "$APP.service" >/dev/null 2>&1 || true
     cat > "$UNIT_DIR/$APP.service" <<SVC_EOF
 [Unit]
 Description=Captive portal auto-login (re-authenticate when the session expires)
@@ -1159,6 +1234,7 @@ TIMER_EOF
     systemctl daemon-reload
     systemctl enable --now "$APP.timer" >/dev/null
     echo "  ok  systemd timer enabled (every 5 minutes, and 90s after every boot)"
+   fi
 
     # network-online.target is a no-op unless a wait-online service is enabled
     if systemctl list-unit-files 2>/dev/null | grep -q '^NetworkManager-wait-online\.service'; then
@@ -1196,6 +1272,8 @@ DISP_EOF
 
   cat <<DONE
 
+running as: $([ "$INSTALL_MODE" = daemon ] && echo "an always-on daemon (auto-restarts, starts at boot)" || echo "a systemd timer every 5 min (also starts 90s after boot)")
+
 next steps
   1. credentials:   sudo nano $CONF_FILE
   2. see the form:  sudo $APP inspect
@@ -1212,6 +1290,7 @@ do_uninstall() {
   need_root uninstall
   if have systemctl; then
     systemctl disable --now "$APP.timer" >/dev/null 2>&1 || true
+    systemctl disable --now "$APP.service" >/dev/null 2>&1 || true
     rm -f "$UNIT_DIR/$APP.service" "$UNIT_DIR/$APP.timer"
     systemctl daemon-reload || true
     echo "  ok  systemd units removed"
@@ -1309,6 +1388,18 @@ do_status() {
   printf 'fails  : %s\n\n' "${FAILS:-0}"
   c=$(classify); printf 'now    : %s (%s)\n\n' "${c%%|*}" "${c#*|}"
   if have systemctl; then
+    local _svc _tmr
+    _svc=$(systemctl is-enabled "$APP.service" 2>/dev/null | head -1)
+    _tmr=$(systemctl is-enabled "$APP.timer"   2>/dev/null | head -1)
+    if [ "$_svc" = enabled ]; then
+      printf 'mode   : always-on daemon (%s)\n\n' "$(systemctl is-active "$APP.service" 2>/dev/null | head -1)"
+      systemctl status "$APP.service" --no-pager -n 0 2>/dev/null | head -5
+      printf '\n'
+    elif [ "$_tmr" = enabled ]; then
+      printf 'mode   : systemd timer\n\n'
+    else
+      printf 'mode   : NOT INSTALLED - run: sudo %s install\n\n' "$APP"
+    fi
     systemctl list-timers "$APP.timer" --no-pager 2>/dev/null | head -4
     printf '\n'
     journalctl -u "$APP" -n 20 --no-pager 2>/dev/null || true
@@ -1326,12 +1417,15 @@ usage() {
 
 main() {
   local cmd="" ASSUME_YES=no verbose=no url_override="" conf_override=""
+  INSTALL_MODE=timer
   while [ $# -gt 0 ]; do
     case "$1" in
       check|once|login|daemon|inspect|install|uninstall|harden|status) cmd=$1 ;;
       -c|--config)  conf_override=${2:?--config needs a path}; shift ;;
       -u|--url)     url_override=${2:?--url needs a URL}; shift ;;
       -v|--verbose) verbose=yes ;;
+      --daemon)     INSTALL_MODE=daemon ;;
+      --timer)      INSTALL_MODE=timer ;;
       -y|--yes)     ASSUME_YES=yes ;;
       -h|--help)    usage 0 ;;
       -V|--version) echo "$APP $VERSION"; exit 0 ;;
