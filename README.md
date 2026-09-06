@@ -128,6 +128,65 @@ That installs:
 
 ---
 
+## Step 2b — it keeps itself running; you never start it by hand
+
+Do **not** run the script in a terminal and leave it there. It dies the moment
+you close the window, log out, or the box reboots. `install` sets it up to run
+by itself, as root, forever — starting again on its own after a reboot or a
+power cut. Two ways, both survive reboots. Pick one:
+
+**Mode A — timer (default).** A check every 5 minutes, plus 90 seconds after
+every boot, plus instantly whenever a network link comes up.
+
+```bash
+sudo ./portal-login.sh install
+```
+
+**Mode B — always-on daemon.** One long-running process that loops forever.
+`Restart=always` brings it back if it ever dies, and a systemd watchdog restarts
+it if the loop wedges *without* exiting — the failure `Restart=always` alone
+cannot catch.
+
+```bash
+sudo ./portal-login.sh install --daemon
+```
+
+Switching between them is safe: each mode disables the other, so you never end
+up with both running.
+
+There is no meaningful reliability difference. The timer is marginally more
+robust because every check starts from a fresh process; the daemon is nicer if
+you like seeing a live process and a continuously streaming log. Mode A is the
+default for that reason.
+
+### Prove it will come back on its own
+
+```bash
+systemctl is-enabled portal-login.timer portal-login.service 2>/dev/null
+```
+
+At least one must say `enabled` — that is what makes systemd start it at boot.
+Then the honest test:
+
+```bash
+sudo reboot
+```
+
+and once it is back up:
+
+```bash
+sudo portal-login status
+```
+
+It should report a mode, and a `last ok` timestamp from the last few minutes,
+with nobody having logged in or typed anything.
+
+> **A power cut is not only a software problem.** Many desktop boards default
+> "Restore on AC Power Loss" to *Power Off*, so after a cut the machine never
+> turns on at all and no script can help. Check that setting in the BIOS while
+> you are at the machine. Your disk is not LUKS-encrypted, so provided the BIOS
+> powers on, the box boots unattended and re-authenticates by itself.
+
 ## Step 3 — where the username and password go
 
 **In one file, on the box, that only root can read:**
