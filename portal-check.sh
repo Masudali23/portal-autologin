@@ -150,26 +150,34 @@ if have nmcli; then
   say ""
   say "  -- connection profiles --"
   nmcli -t -f NAME,TYPE,DEVICE connection show 2>/dev/null | sed 's/^/    /' | tee -a "$OUT"
+  dupes=$(nmcli -t -f NAME connection show 2>/dev/null | sort | uniq -d | tr '\n' ' ')
+  [ -n "$dupes" ] && note "duplicate profile names present (${dupes}) - harmless, but they are listed below by UUID"
   say ""
-  nmcli -t -f NAME connection show 2>/dev/null | while IFS= read -r cn; do
-    [ -z "$cn" ] && continue
+  # Address profiles by UUID, not name: names are not unique, and
+  # `nmcli -g <field> connection show <name>` returns one line PER match, which
+  # corrupts every value and raised a false password-flags alarm.
+  nmcli -t -f UUID,NAME connection show 2>/dev/null | while IFS= read -r row; do
+    [ -z "$row" ] && continue
+    uuid=${row%%:*}; cn=${row#*:}
+    [ -z "$uuid" ] && continue
     say "  -- profile: $cn --"
     for f in 802-1x.eap 802-1x.identity 802-1x.password-flags connection.permissions \
              connection.autoconnect connection.autoconnect-retries ipv6.method; do
-      v=$(nmcli -g "$f" connection show "$cn" 2>/dev/null)
+      v=$(nmcli -g "$f" connection show "$uuid" 2>/dev/null | head -1)
       case "$f" in
         802-1x.identity) [ -n "$v" ] && v="<set, ${#v} chars>" ;;
       esac
       kv "    $f" "${v:-<unset>}"
     done
-    pf=$(nmcli -g 802-1x.password-flags connection show "$cn" 2>/dev/null)
-    eap=$(nmcli -g 802-1x.eap connection show "$cn" 2>/dev/null)
+    pf=$(nmcli -g 802-1x.password-flags connection show "$uuid" 2>/dev/null | head -1)
+    eap=$(nmcli -g 802-1x.eap connection show "$uuid" 2>/dev/null | head -1)
     if [ -n "$eap" ] && [ "$pf" != "0" ] && [ -n "$pf" ]; then
       note "PROBLEM: this 802.1X profile has password-flags=$pf (not 0)."
       note "That means NetworkManager asks a logged-in desktop for the password."
       note "At 3am there is no desktop, so the box never associates at all."
-      note "Fix: sudo nmcli connection modify \"$cn\" 802-1x.password-flags 0 \\"
+      note "Fix: sudo nmcli connection modify $uuid 802-1x.password-flags 0 \\"
       note "       802-1x.password '<your-wifi-password>' connection.permissions \"\""
+      note "     (UUID of \"$cn\" - use it, the names here are not unique)"
     fi
     say ""
   done
