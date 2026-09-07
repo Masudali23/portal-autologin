@@ -13,7 +13,7 @@ Every command below was run on a real machine and produced the output shown.
 portal on port 1000 — `192.168.249.1` on the departmental LAN, `192.168.252.1`
 on wifi. The gateway is discovered at runtime, so moving between them needs no
 config change. The same script runs on macOS 15 (bash 3.2, launchd) — see
-[macOS](#macos) below.
+[macOS](#macos) below. A PowerShell port for Windows is under [Windows](#windows).
 
 ---
 
@@ -418,6 +418,107 @@ sudo portal-login uninstall
 
 Requests are pinned to the physical interface (`route -n get default`) and
 forced to IPv4, skipping `utun*` VPN tunnels — the same protection as on Linux.
+
+## Windows
+
+`portal-login.ps1` is a PowerShell port that drives the **same `curl.exe`
+invocations** — Windows 10 (1803+) and 11 ship `C:\Windows\System32\curl.exe`.
+It runs as `SYSTEM` from Task Scheduler, so it works with nobody logged in and
+survives reboots. Windows PowerShell 5.1 (built in) is enough; nothing to install.
+
+> Status: written to mirror the tested Linux/macOS logic and reviewed, but not
+> yet run on a real Windows machine. Please report what you see.
+
+Open **PowerShell as Administrator**, then:
+
+```powershell
+git clone https://github.com/Masudali23/portal-autologin.git; cd portal-autologin
+```
+
+If you downloaded a zip through a browser instead of `git`, Windows marks the
+file as from the internet and refuses to run it. Clear that first:
+
+```powershell
+Unblock-File .\portal-login.ps1
+```
+
+Install (the `-ExecutionPolicy Bypass` is needed once, for this launch; the
+scheduled task carries its own):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\portal-login.ps1 install
+```
+
+Expected:
+
+```
+  ok  installed C:\ProgramData\portal-login\portal-login.ps1
+  ok  ACL: SYSTEM + Administrators only on C:\ProgramData\portal-login
+  ok  created C:\ProgramData\portal-login\portal-login.conf
+  ok  scheduled task 'portal-login' registered (every 5 min, 90s after boot, and on network connect) as SYSTEM
+```
+
+### Credentials
+
+```powershell
+notepad C:\ProgramData\portal-login\portal-login.conf
+```
+
+(Notepad must be started from the elevated PowerShell — the folder is readable
+only by `SYSTEM` and Administrators.) Fill in `PORTAL_USERNAME` and
+`PORTAL_PASSWORD`, save. Same rules as Linux: no quotes, any character is safe,
+the file is parsed and never executed.
+
+### Verify
+
+```powershell
+.\portal-login.ps1 inspect
+```
+
+```powershell
+.\portal-login.ps1 login -Trace
+```
+
+```powershell
+.\portal-login.ps1 status
+```
+
+`status` shows the task state, its last result (`0` = ok) and next run. Watch it live:
+
+```powershell
+Get-Content C:\ProgramData\portal-login\portal-login.log -Wait -Tail 20
+```
+
+### Keep the PC awake — and make the boot trigger real
+
+```powershell
+.\portal-login.ps1 harden
+```
+
+Besides never sleeping on AC power and turning off NIC power management, this
+runs `powercfg /hibernate off`. That is not optional on Windows: with **Fast
+Startup** on (the default), "shut down" is really a hibernate and the next
+power-on is a resume — so the at-boot task trigger never fires. Turning
+hibernate off disables Fast Startup and makes boots real.
+
+### How the Windows version differs
+
+| | Linux / macOS | Windows |
+|---|---|---|
+| Runs as | root (systemd / launchd) | `SYSTEM` (Task Scheduler) |
+| Every 5 min | timer / `StartInterval` | repeating trigger, no end |
+| At boot | 90s after boot / `RunAtLoad` | `-AtStartup` + 90s delay |
+| On network change | NM hook / `WatchPaths` | event `NetworkProfile 10000` |
+| Config | `/etc/portal-login/` mode 600 | `C:\ProgramData\portal-login\`, ACL SYSTEM+Admins |
+| Interface pin | interface **name** | interface **IP** (Windows curl rejects names) |
+| Secrets | root-only file | admin-only file — see note |
+
+Note on secrets: the password sits in a file only `SYSTEM` and Administrators
+can read — the Windows equivalent of a root-only file. A stronger option exists
+(DPAPI encrypted *as SYSTEM*), but it needs an extra one-shot task to do the
+encrypting; it is not implemented yet.
+
+Remove everything: `.\portal-login.ps1 uninstall` (keeps your config and log).
 
 ## Updating
 

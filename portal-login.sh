@@ -34,7 +34,7 @@
 #
 set -uo pipefail
 
-VERSION=2.3.0
+VERSION=2.4.0
 APP=portal-login
 SELF=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
 
@@ -290,6 +290,7 @@ setup_runtime() {
 # So: force IPv4, and pin every request to the physical NIC that holds the
 # default route, explicitly skipping tunnel and bridge interfaces.
 PHYS_IFACE=""
+TUNNEL_DEFAULT=no         # set when the default route belongs to a VPN/tunnel
 detect_phys_iface() {
   [ -n "$PHYS_IFACE" ] && { printf '%s' "$PHYS_IFACE"; return; }
   local i
@@ -297,7 +298,7 @@ detect_phys_iface() {
     i=$(route -n get default 2>/dev/null | awk '/interface:/ { print $2; exit }')
     case "$i" in
       utun*|gif*|stf*|bridge*|awdl*|llw*|ap*|anpi*|lo*|'')
-        [ -n "$i" ] && warn "the default route is via '$i' (a tunnel/virtual interface) - looking for a physical NIC"
+        [ -n "$i" ] && { TUNNEL_DEFAULT=yes; warn "the default route is via '$i' (a tunnel/virtual interface) - looking for a physical NIC"; }
         local c; i=""
         for c in $(ifconfig -l 2>/dev/null); do
           case "$c" in en*) ipconfig getifaddr "$c" >/dev/null 2>&1 && { i=$c; break; } ;; esac
@@ -312,6 +313,7 @@ detect_phys_iface() {
       awk '{ for (n = 1; n < NF; n++) if ($n == "dev") { print $(n+1); exit } }')
   case "$i" in
     tailscale*|docker*|virbr*|wg*|tun*|tap*|br-*|zt*|veth*|lo)
+      TUNNEL_DEFAULT=yes
       warn "the default route is via '$i' (a tunnel/bridge) - looking for a physical NIC"
       i=$(ip -4 route show 2>/dev/null |
           awk '{ for (n = 1; n < NF; n++) if ($n == "dev") print $(n+1) }' |
@@ -331,11 +333,18 @@ curl_opts() {
               --header 'Cache-Control: no-cache, no-store'
               --header 'Pragma: no-cache' )
   [ "$(lc "$FORCE_IPV4")" = "yes" ] && CURL_ARGS+=( --ipv4 )
+  [ "${NO_PIN:-0}" = 1 ] && return 0          # a deliberately unpinned probe
+  local _i
   case "$(lc "$INTERFACE")" in
     ''|any|none) : ;;
-    auto)   local _i; _i=$(detect_phys_iface); [ -n "$_i" ] && CURL_ARGS+=( --interface "$_i" ) ;;
-    *)      CURL_ARGS+=( --interface "$INTERFACE" ) ;;
+    auto)   _i=$(detect_phys_iface) ;;
+    *)      _i=$INTERFACE ;;
   esac
+  if [ -n "$_i" ]; then
+    # macOS curl needs the explicit "if!" prefix to be sure it binds an interface
+    # name rather than trying it as a hostname; Linux accepts the bare name.
+    [ "$IS_MAC" = yes ] && CURL_ARGS+=( --interface "if!$_i" ) || CURL_ARGS+=( --interface "$_i" )
+  fi
   return 0
 }
 
@@ -466,6 +475,14 @@ classify() {
     0) printf 'ONLINE|connectivity probe returned a clean response'; return ;;
     1) printf 'NEED_LOGIN|connectivity probe was intercepted by a portal'; return ;;
   esac
+
+  # Nothing answered on the pinned NIC. If a VPN owns the default route, that
+  # can simply be its kill-switch dropping non-tunnel traffic while the machine
+  # has perfectly good internet through the tunnel. Check once unpinned before
+  # concluding anything - logging out on this false alarm would cut the VPN.
+  if [ "$TUNNEL_DEFAULT" = yes ] && NO_PIN=1 probe_internet; then
+    printf 'ONLINE|internet works through the VPN tunnel (pinned-NIC probe blocked) - nothing to do'; return
+  fi
 
   nm=$(nm_connectivity || true)
   case "$nm" in
@@ -1281,9 +1298,9 @@ write_plist_netwatch() {  # $1 = path
   <key>WatchPaths</key>
   <array>
     <string>/private/var/run/resolv.conf</string>
-    <string>/Library/Preferences/SystemConfiguration/NetworkInterfaces.plist</string>
+    <string>/Library/Preferences/SystemConfiguration</string>
   </array>
-  <key>ThrottleInterval</key><integer>15</integer>
+  <key>ThrottleInterval</key><integer>30</integer>
   <key>ProcessType</key><string>Background</string>
   <key>StandardOutPath</key><string>$MAC_LOG</string>
   <key>StandardErrorPath</key><string>$MAC_LOG</string>
@@ -1329,7 +1346,7 @@ install_launchd() {
 
   # rotate the log so it cannot grow forever
   if [ -d /etc/newsyslog.d ]; then
-    printf '# logfilename                  [owner:group]  mode count size when flags\n%s  644  5  1024  *  J\n' \
+    printf '# logfilename                  [owner:group]  mode count size when flags\n%s  644  5  1024  *  JN\n' \
       "$MAC_LOG" > "$NEWSYSLOG_CONF"
     echo "  ok  log rotation configured ($NEWSYSLOG_CONF)"
   fi
@@ -1395,8 +1412,12 @@ PLAN
   display dummy plug, if the machine is a laptop.
 
   macOS also has its own captive-portal assistant that opens a login window.
-  It does not interfere with this tool; if the pop-up annoys you:
-    sudo defaults write /Library/Preferences/SystemConfiguration/com.apple.captive.control Active -bool false
+  It does not interfere with this tool. (The old
+  com.apple.captive.control Active=false trick is unreliable on recent macOS.)
+
+  There is no network-online wait in launchd: the run at boot may happen before
+  DHCP finishes and will correctly report NETWORK_DOWN; the network-change job
+  and the 5-minute tick pick it up seconds later.
 
   To undo:  sudo pmset -c restoredefaults ; sudo pmset -a womp 0
 
@@ -1414,7 +1435,16 @@ do_install() {
   # BUG FIX: the destination directory is not guaranteed to exist (macOS has
   # no /usr/local/sbin), and a failed copy used to be reported as success.
   install -d -m 0755 "$(dirname "$BIN_PATH")" || die "cannot create $(dirname "$BIN_PATH")"
-  install -m 0755 "$SELF" "$BIN_PATH" || die "failed to install $BIN_PATH"
+  if [ "$IS_MAC" = yes ]; then
+    # A script downloaded through a browser carries com.apple.quarantine and
+    # Gatekeeper refuses to execute it. git/scp/curl do not set it; clear it anyway.
+    xattr -d com.apple.quarantine "$SELF" >/dev/null 2>&1 || true
+    # Homebrew on Intel chowns /usr/local/bin to the user; a root daemon must
+    # not execute a user-writable file.
+    install -o root -g wheel -m 0755 "$SELF" "$BIN_PATH" || die "failed to install $BIN_PATH"
+  else
+    install -m 0755 "$SELF" "$BIN_PATH" || die "failed to install $BIN_PATH"
+  fi
   [ -x "$BIN_PATH" ] || die "$BIN_PATH is not executable after install"
   echo "  ok  installed $BIN_PATH"
 
