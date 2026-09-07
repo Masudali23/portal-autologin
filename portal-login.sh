@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# portal-login.sh - unattended captive-portal re-authentication for Linux.
+# portal-login.sh - unattended captive-portal re-authentication for Linux and macOS.
 #
 #   Keeps a machine logged in to a gateway captive portal (IIT BHU / FortiGate
 #   style, http://<gateway>:1000/) so that long-running work and remote access
@@ -34,9 +34,15 @@
 #
 set -uo pipefail
 
-VERSION=2.2.0
+VERSION=2.3.0
 APP=portal-login
 SELF=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")
+
+# Linux and macOS share this script. macOS differs in the service manager
+# (launchd, not systemd), the network tooling (route/ifconfig, not ip/nmcli),
+# and a few paths; everything is branched on IS_MAC.
+OS_NAME=$(uname -s 2>/dev/null || echo Linux)
+IS_MAC=no; [ "$OS_NAME" = Darwin ] && IS_MAC=yes
 
 # --------------------------------------------------------------------------
 # defaults - every one of these can be overridden in the config file
@@ -85,7 +91,11 @@ UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrom
 # --------------------------------------------------------------------------
 if [ "$(id -u)" -eq 0 ]; then
   CONF_FILE="${PORTAL_LOGIN_CONF:-/etc/$APP/$APP.conf}"
-  STATE_DIR="${PORTAL_LOGIN_STATE:-/var/lib/$APP}"
+  if [ "$IS_MAC" = yes ]; then
+    STATE_DIR="${PORTAL_LOGIN_STATE:-/var/db/$APP}"      # /var/lib does not exist on macOS
+  else
+    STATE_DIR="${PORTAL_LOGIN_STATE:-/var/lib/$APP}"
+  fi
 else
   CONF_FILE="${PORTAL_LOGIN_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/$APP/$APP.conf}"
   STATE_DIR="${PORTAL_LOGIN_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/$APP}"
@@ -282,8 +292,22 @@ setup_runtime() {
 PHYS_IFACE=""
 detect_phys_iface() {
   [ -n "$PHYS_IFACE" ] && { printf '%s' "$PHYS_IFACE"; return; }
-  have ip || return 0
   local i
+  if [ "$IS_MAC" = yes ]; then
+    i=$(route -n get default 2>/dev/null | awk '/interface:/ { print $2; exit }')
+    case "$i" in
+      utun*|gif*|stf*|bridge*|awdl*|llw*|ap*|anpi*|lo*|'')
+        [ -n "$i" ] && warn "the default route is via '$i' (a tunnel/virtual interface) - looking for a physical NIC"
+        local c; i=""
+        for c in $(ifconfig -l 2>/dev/null); do
+          case "$c" in en*) ipconfig getifaddr "$c" >/dev/null 2>&1 && { i=$c; break; } ;; esac
+        done ;;
+    esac
+    PHYS_IFACE=$i
+    [ -n "$i" ] && debug "pinning requests to interface $i"
+    printf '%s' "$i"; return
+  fi
+  have ip || return 0
   i=$(ip -4 route show default 2>/dev/null |
       awk '{ for (n = 1; n < NF; n++) if ($n == "dev") { print $(n+1); exit } }')
   case "$i" in
@@ -1057,9 +1081,21 @@ do_inspect() {
 # install / uninstall / harden / status
 # --------------------------------------------------------------------------
 INSTALL_MODE=timer        # timer | daemon  (see: install --daemon)
-BIN_PATH=/usr/local/sbin/$APP
+if [ "$IS_MAC" = yes ]; then
+  BIN_PATH="${PORTAL_LOGIN_BIN:-/usr/local/bin/$APP}"   # /usr/local/sbin does not exist on macOS
+else
+  BIN_PATH="${PORTAL_LOGIN_BIN:-/usr/local/sbin/$APP}"
+fi
 UNIT_DIR=/etc/systemd/system
 DISPATCH=/etc/NetworkManager/dispatcher.d/90-$APP
+# macOS / launchd
+PLIST_DIR="${PORTAL_LOGIN_PLIST_DIR:-/Library/LaunchDaemons}"
+LABEL_CHECK=com.portal-login.check
+LABEL_DAEMON=com.portal-login.daemon
+LABEL_NETWATCH=com.portal-login.netwatch
+MAC_LOG=/var/log/$APP.log
+NEWSYSLOG_CONF=/etc/newsyslog.d/$APP.conf
+RUN_AS=""                 # human summary of how it was installed, set by do_install
 
 need_root() { [ "$(id -u)" -eq 0 ] || die "this command needs root: sudo $APP $1"; }
 
@@ -1182,12 +1218,204 @@ WantedBy=multi-user.target
 DSVC_EOF
 }
 
+# --------------------------------------------------------------------------
+# macOS: launchd
+# --------------------------------------------------------------------------
+# A LaunchDaemon (in /Library/LaunchDaemons, root:wheel 644) runs as root with
+# nobody logged in and is started by launchd at boot - the direct equivalent
+# of a root systemd unit. StartInterval gives the 5-minute cadence, RunAtLoad
+# the run-at-boot; KeepAlive is deliberately absent on the periodic job, since
+# launchd would otherwise respawn a oneshot the moment it exits.
+plist_header() {
+  cat <<'PH'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+PH
+}
+
+write_plist_check() {     # $1 = path
+  { plist_header; cat <<PC
+  <key>Label</key><string>$LABEL_CHECK</string>
+  <key>ProgramArguments</key>
+  <array><string>$BIN_PATH</string><string>once</string></array>
+  <key>StartInterval</key><integer>300</integer>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>Nice</key><integer>10</integer>
+  <key>StandardOutPath</key><string>$MAC_LOG</string>
+  <key>StandardErrorPath</key><string>$MAC_LOG</string>
+</dict>
+</plist>
+PC
+  } > "$1"
+}
+
+write_plist_daemon() {    # $1 = path
+  { plist_header; cat <<PD
+  <key>Label</key><string>$LABEL_DAEMON</string>
+  <key>ProgramArguments</key>
+  <array><string>$BIN_PATH</string><string>daemon</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>Nice</key><integer>10</integer>
+  <key>StandardOutPath</key><string>$MAC_LOG</string>
+  <key>StandardErrorPath</key><string>$MAC_LOG</string>
+</dict>
+</plist>
+PD
+  } > "$1"
+}
+
+# The macOS counterpart of the NetworkManager hook: configd rewrites
+# resolv.conf on every network change (join wifi, plug in ethernet, DHCP
+# renew), so watching it fires a check the moment the link changes.
+write_plist_netwatch() {  # $1 = path
+  { plist_header; cat <<PN
+  <key>Label</key><string>$LABEL_NETWATCH</string>
+  <key>ProgramArguments</key>
+  <array><string>$BIN_PATH</string><string>once</string></array>
+  <key>WatchPaths</key>
+  <array>
+    <string>/private/var/run/resolv.conf</string>
+    <string>/Library/Preferences/SystemConfiguration/NetworkInterfaces.plist</string>
+  </array>
+  <key>ThrottleInterval</key><integer>15</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>$MAC_LOG</string>
+  <key>StandardErrorPath</key><string>$MAC_LOG</string>
+</dict>
+</plist>
+PN
+  } > "$1"
+}
+
+launchd_load() {          # $1 = label
+  # bootstrap refuses an already-loaded job, so unload first (ignore failure)
+  launchctl bootout "system/$1" >/dev/null 2>&1 || true
+  launchctl enable "system/$1" >/dev/null 2>&1 || true
+  launchctl bootstrap system "$PLIST_DIR/$1.plist"
+}
+
+launchd_unload() {        # $1 = label
+  launchctl bootout "system/$1" >/dev/null 2>&1 || true
+  rm -f "$PLIST_DIR/$1.plist"
+}
+
+install_launchd() {
+  install -d -m 0755 "$PLIST_DIR"
+  touch "$MAC_LOG" 2>/dev/null; chmod 644 "$MAC_LOG" 2>/dev/null || true
+
+  if [ "$INSTALL_MODE" = daemon ]; then
+    launchd_unload "$LABEL_CHECK"
+    write_plist_daemon "$PLIST_DIR/$LABEL_DAEMON.plist"
+    chown root:wheel "$PLIST_DIR/$LABEL_DAEMON.plist"; chmod 644 "$PLIST_DIR/$LABEL_DAEMON.plist"
+    launchd_load "$LABEL_DAEMON" && echo "  ok  launchd daemon loaded ($LABEL_DAEMON) - always running, restarts itself, starts at boot"
+    RUN_AS="a launchd daemon (always running, restarts itself, starts at boot)"
+  else
+    launchd_unload "$LABEL_DAEMON"
+    write_plist_check "$PLIST_DIR/$LABEL_CHECK.plist"
+    chown root:wheel "$PLIST_DIR/$LABEL_CHECK.plist"; chmod 644 "$PLIST_DIR/$LABEL_CHECK.plist"
+    launchd_load "$LABEL_CHECK" && echo "  ok  launchd job loaded ($LABEL_CHECK) - every 5 minutes, and at boot"
+    RUN_AS="a launchd job every 5 min (also runs at boot)"
+  fi
+
+  write_plist_netwatch "$PLIST_DIR/$LABEL_NETWATCH.plist"
+  chown root:wheel "$PLIST_DIR/$LABEL_NETWATCH.plist"; chmod 644 "$PLIST_DIR/$LABEL_NETWATCH.plist"
+  launchd_load "$LABEL_NETWATCH" && echo "  ok  network-change hook loaded ($LABEL_NETWATCH)"
+
+  # rotate the log so it cannot grow forever
+  if [ -d /etc/newsyslog.d ]; then
+    printf '# logfilename                  [owner:group]  mode count size when flags\n%s  644  5  1024  *  J\n' \
+      "$MAC_LOG" > "$NEWSYSLOG_CONF"
+    echo "  ok  log rotation configured ($NEWSYSLOG_CONF)"
+  fi
+}
+
+uninstall_launchd() {
+  launchd_unload "$LABEL_CHECK"
+  launchd_unload "$LABEL_DAEMON"
+  launchd_unload "$LABEL_NETWATCH"
+  rm -f "$NEWSYSLOG_CONF"
+  echo "  ok  launchd jobs removed"
+}
+
+status_launchd() {
+  local l
+  for l in "$LABEL_DAEMON" "$LABEL_CHECK"; do
+    if launchctl print "system/$l" >/dev/null 2>&1; then
+      if [ "$l" = "$LABEL_DAEMON" ]; then printf 'mode   : launchd daemon (always running)\n'
+      else printf 'mode   : launchd job every 5 min\n'; fi
+      launchctl print "system/$l" 2>/dev/null |
+        grep -E 'state = |last exit code|run interval|runs = |pid = ' | sed 's/^[[:space:]]*/         /'
+      printf '\n'
+      break
+    fi
+  done
+  launchctl print "system/$LABEL_CHECK"  >/dev/null 2>&1 || \
+  launchctl print "system/$LABEL_DAEMON" >/dev/null 2>&1 || \
+    printf 'mode   : NOT INSTALLED - run: sudo %s install\n\n' "$APP"
+  launchctl print "system/$LABEL_NETWATCH" >/dev/null 2>&1 && printf 'hook   : network-change watcher loaded\n\n'
+  [ -f "$MAC_LOG" ] && { printf -- '-- last 20 log lines (%s) --\n' "$MAC_LOG"; tail -20 "$MAC_LOG"; }
+}
+
+confirm_proceed() {
+  if [ "${ASSUME_YES:-no}" = "yes" ]; then return 0; fi
+  if [ -t 0 ]; then
+    printf 'proceed? [y/N] '; read -r ans
+    case "$(lc "$ans")" in y|yes) return 0 ;; *) echo "aborted."; return 1 ;; esac
+  fi
+  die "not a terminal - re-run with: $APP harden --yes"
+}
+
+harden_mac() {
+  cat <<'PLAN'
+
+'harden' makes this Mac survive an unattended night. It will:
+
+  1. pmset -c sleep 0 disksleep 0     -> never sleep while on mains power
+  2. pmset -a womp 1                  -> wake on LAN
+  3. pmset -a tcpkeepalive 1          -> keep TCP sessions alive in low-power states
+
+Only the on-charger (-c) profile is changed, so a laptop on battery still
+sleeps normally. Undo notes are printed at the end.
+
+PLAN
+  confirm_proceed || return 0
+  pmset -c sleep 0 disksleep 0 2>/dev/null && echo "  ok  no sleep on mains power"
+  pmset -a womp 1 2>/dev/null          && echo "  ok  wake on LAN"
+  pmset -a tcpkeepalive 1 2>/dev/null  && echo "  ok  tcp keepalive"
+  cat <<'UNDO'
+
+  A closed MacBook still sleeps (clamshell) unless it is on power AND has an
+  external display or keyboard attached. Leave the lid open, or use a
+  display dummy plug, if the machine is a laptop.
+
+  macOS also has its own captive-portal assistant that opens a login window.
+  It does not interfere with this tool; if the pop-up annoys you:
+    sudo defaults write /Library/Preferences/SystemConfiguration/com.apple.captive.control Active -bool false
+
+  To undo:  sudo pmset -c restoredefaults ; sudo pmset -a womp 0
+
+UNDO
+}
+
 do_install() {
   need_root install
   have curl || die "curl is required: sudo apt install -y curl  (or dnf/pacman)"
-  have flock || warn "flock not found (util-linux); falling back to a mkdir lock"
+  if ! have flock; then
+    [ "$IS_MAC" = yes ] && debug "no flock on macOS - using the mkdir lock" \
+                        || warn "flock not found (util-linux); falling back to a mkdir lock"
+  fi
 
-  install -m 0755 "$SELF" "$BIN_PATH"
+  # BUG FIX: the destination directory is not guaranteed to exist (macOS has
+  # no /usr/local/sbin), and a failed copy used to be reported as success.
+  install -d -m 0755 "$(dirname "$BIN_PATH")" || die "cannot create $(dirname "$BIN_PATH")"
+  install -m 0755 "$SELF" "$BIN_PATH" || die "failed to install $BIN_PATH"
+  [ -x "$BIN_PATH" ] || die "$BIN_PATH is not executable after install"
   echo "  ok  installed $BIN_PATH"
 
   install -d -m 0700 "$(dirname "$CONF_FILE")"
@@ -1200,7 +1428,9 @@ do_install() {
   fi
   install -d -m 0700 "$STATE_DIR"
 
-  if have systemctl && [ -d /run/systemd/system ]; then
+  if [ "$IS_MAC" = yes ]; then
+    install_launchd
+  elif have systemctl && [ -d /run/systemd/system ]; then
    if [ "$INSTALL_MODE" = daemon ]; then
     # switching modes: make sure the timer is not also running
     systemctl disable --now "$APP.timer" >/dev/null 2>&1 || true
@@ -1209,6 +1439,7 @@ do_install() {
     systemctl daemon-reload
     systemctl enable --now "$APP.service" >/dev/null
     echo "  ok  always-on daemon enabled (checks every ${CHECK_INTERVAL}s, restarts itself, starts at boot)"
+    RUN_AS="an always-on systemd daemon (auto-restarts, starts at boot)"
    else
     # switching modes: make sure a daemon is not also running
     systemctl disable --now "$APP.service" >/dev/null 2>&1 || true
@@ -1267,6 +1498,7 @@ TIMER_EOF
     systemctl daemon-reload
     systemctl enable --now "$APP.timer" >/dev/null
     echo "  ok  systemd timer enabled (every 5 minutes, and 90s after every boot)"
+    RUN_AS="a systemd timer every 5 min (also starts 90s after boot)"
    fi
 
     # network-online.target is a no-op unless a wait-online service is enabled
@@ -1281,6 +1513,7 @@ TIMER_EOF
     warn "no systemd - falling back to cron"
     ( crontab -l 2>/dev/null | grep -v "$APP" ; echo "*/5 * * * * $BIN_PATH once >/dev/null 2>&1" ) | crontab -
     echo "  ok  crontab entry added (every 5 minutes)"
+    RUN_AS="a cron job every 5 min (no systemd on this box)"
   fi
 
   # Fire immediately when a link comes up, instead of waiting up to 5 minutes.
@@ -1305,7 +1538,7 @@ DISP_EOF
 
   cat <<DONE
 
-running as: $([ "$INSTALL_MODE" = daemon ] && echo "an always-on daemon (auto-restarts, starts at boot)" || echo "a systemd timer every 5 min (also starts 90s after boot)")
+running as: ${RUN_AS:-unknown}
 
 next steps
   1. credentials:   sudo nano $CONF_FILE
@@ -1313,7 +1546,7 @@ next steps
   3. test it:       sudo $APP check       # just report the state
                     sudo $APP login -v    # force one login, verbose
   4. watch it:      sudo $APP status
-                    journalctl -u $APP -f
+                    $([ "$IS_MAC" = yes ] && echo "tail -f $MAC_LOG" || echo "journalctl -u $APP -f")
   5. optional:      sudo $APP harden      # no suspend, no wifi powersave
 
 DONE
@@ -1321,7 +1554,9 @@ DONE
 
 do_uninstall() {
   need_root uninstall
-  if have systemctl; then
+  if [ "$IS_MAC" = yes ]; then
+    uninstall_launchd
+  elif have systemctl; then
     systemctl disable --now "$APP.timer" >/dev/null 2>&1 || true
     systemctl disable --now "$APP.service" >/dev/null 2>&1 || true
     rm -f "$UNIT_DIR/$APP.service" "$UNIT_DIR/$APP.timer"
@@ -1340,6 +1575,7 @@ do_uninstall() {
 
 do_harden() {
   need_root harden
+  if [ "$IS_MAC" = yes ]; then harden_mac; return $?; fi
   cat <<PLAN
 
 'harden' makes this machine survive an unattended night. It will:
@@ -1354,14 +1590,7 @@ do_harden() {
 These are system-wide and persist across reboots. Undo notes are printed at the end.
 
 PLAN
-  if [ "${ASSUME_YES:-no}" != "yes" ]; then
-    if [ -t 0 ]; then
-      printf 'proceed? [y/N] '; read -r ans
-      case "$(lc "$ans")" in y|yes) ;; *) echo "aborted."; return 0 ;; esac
-    else
-      die "not a terminal - re-run with: $APP harden --yes"
-    fi
-  fi
+  confirm_proceed || return 0
 
   systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target >/dev/null 2>&1 \
     && echo "  ok  suspend/hibernate masked"
@@ -1444,12 +1673,14 @@ do_status() {
   printf 'passwd : %s\n' "$([ -n "$PORTAL_PASSWORD" ] && echo '<set>' || echo '<NOT SET>')"
   load_state
   if [ "${LAST_OK:-0}" -gt 0 ] 2>/dev/null; then
-    printf 'last ok: %s (%sm ago)\n' "$(date -d "@$LAST_OK" 2>/dev/null || echo "$LAST_OK")" \
+    printf 'last ok: %s (%sm ago)\n' "$(date -d "@$LAST_OK" 2>/dev/null || date -r "$LAST_OK" 2>/dev/null || echo "$LAST_OK")" \
            "$(( ($(date +%s) - LAST_OK) / 60 ))"
   fi
   printf 'fails  : %s\n\n' "${FAILS:-0}"
   c=$(classify); printf 'now    : %s (%s)\n\n' "${c%%|*}" "${c#*|}"
-  if have systemctl; then
+  if [ "$IS_MAC" = yes ]; then
+    status_launchd
+  elif have systemctl; then
     local _svc _tmr
     _svc=$(systemctl is-enabled "$APP.service" 2>/dev/null | head -1)
     _tmr=$(systemctl is-enabled "$APP.timer"   2>/dev/null | head -1)
@@ -1529,4 +1760,5 @@ main() {
   esac
 }
 
-main "$@"
+# Set PORTAL_LOGIN_NO_MAIN=1 to source this file for tests without running it.
+[ "${PORTAL_LOGIN_NO_MAIN:-}" = 1 ] || main "$@"

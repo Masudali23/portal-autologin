@@ -3,15 +3,17 @@
 Keeps a headless Linux box authenticated against a FortiGate captive portal, so
 it stays reachable when the session expires overnight.
 
-Pure **bash + curl**. No browser, no Selenium, no Python. Runs as a root systemd
-unit, so it works with nobody logged in.
+Pure **bash + curl**. No browser, no Selenium, no Python. Runs as root under
+systemd (Linux) or launchd (macOS), so it works with nobody logged in. A
+PowerShell port for Windows lives in `portal-login.ps1`.
 
 Every command below was run on a real machine and produced the output shown.
 
 **Verified on:** Ubuntu 22.04.5 LTS, kernel 6.8, IIT (BHU) Varanasi FortiGate
 portal on port 1000 — `192.168.249.1` on the departmental LAN, `192.168.252.1`
 on wifi. The gateway is discovered at runtime, so moving between them needs no
-config change.
+config change. The same script runs on macOS 15 (bash 3.2, launchd) — see
+[macOS](#macos) below.
 
 ---
 
@@ -351,6 +353,71 @@ ssh gpu-box
 Confirm it works from your laptop before you rely on it.
 
 ---
+
+## macOS
+
+Same script, same commands. Differences: the service manager is **launchd**,
+the binary goes to `/usr/local/bin` (macOS has no `/usr/local/sbin`), state
+lives in `/var/db/portal-login`, and output goes to `/var/log/portal-login.log`.
+
+```bash
+git clone https://github.com/Masudali23/portal-autologin.git && cd portal-autologin && chmod +x portal-login.sh
+```
+
+```bash
+sudo ./portal-login.sh install
+```
+
+Expected:
+
+```
+  ok  installed /usr/local/bin/portal-login
+  ok  created /etc/portal-login/portal-login.conf (mode 600)
+  ok  launchd job loaded (com.portal-login.check) - every 5 minutes, and at boot
+  ok  network-change hook loaded (com.portal-login.netwatch)
+  ok  log rotation configured (/etc/newsyslog.d/portal-login.conf)
+
+running as: a launchd job every 5 min (also runs at boot)
+```
+
+Three LaunchDaemons do the work, all as root, all loaded at boot:
+
+| Label | Does |
+|---|---|
+| `com.portal-login.check` | runs `once` every 300s and at boot (`StartInterval` + `RunAtLoad`) |
+| `com.portal-login.netwatch` | runs `once` the moment the network changes (`WatchPaths` on `resolv.conf`) |
+| `com.portal-login.daemon` | only with `install --daemon`: always-running loop, `KeepAlive` restarts it |
+
+Credentials, `inspect`, `login -v` and `status` are identical to Linux. Watch it:
+
+```bash
+tail -f /var/log/portal-login.log
+```
+
+Prove it is loaded and see its last exit code:
+
+```bash
+sudo launchctl print system/com.portal-login.check | grep -E 'state|last exit|run interval'
+```
+
+Keep the Mac awake on mains power (only the on-charger profile is changed, so
+a laptop on battery still sleeps normally):
+
+```bash
+sudo portal-login harden
+```
+
+A closed MacBook still sleeps (clamshell) unless it is on power **and** has an
+external display or keyboard attached — leave the lid open.
+
+Remove everything:
+
+```bash
+sudo portal-login uninstall
+```
+
+Requests are pinned to the physical interface (`route -n get default`) and
+forced to IPv4, skipping `utun*` VPN tunnels — the same protection as on Linux.
 
 ## Updating
 
